@@ -239,7 +239,7 @@ static void raw_err(struct sock *sk, struct sk_buff *skb, u32 info)
 		if (code > NR_ICMP_UNREACH)
 			break;
 		if (code == ICMP_FRAG_NEEDED) {
-			harderr = inet->pmtudisc != IP_PMTUDISC_DONT;
+			harderr = READ_ONCE(inet->pmtudisc) != IP_PMTUDISC_DONT;
 			err = EMSGSIZE;
 		} else {
 			err = icmp_err_convert[code].errno;
@@ -310,7 +310,7 @@ int raw_rcv(struct sock *sk, struct sk_buff *skb)
 	}
 	nf_reset_ct(skb);
 
-	skb_push(skb, skb->data - skb_network_header(skb));
+	skb_push(skb, -skb_network_offset(skb));
 
 	raw_rcv_skb(sk, skb);
 	return 0;

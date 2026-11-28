@@ -2143,13 +2143,6 @@ static int qcom_slim_ngd_ctrl_probe(struct platform_device *pdev)
 	}
 
 	ctrl->dev = dev;
-	ctrl->nb.notifier_call = qcom_slim_ngd_ssr_notify;
-	ctrl->notifier = qcom_register_ssr_notifier("lpass", &ctrl->nb);
-	if (IS_ERR(ctrl->notifier)) {
-		ret = PTR_ERR(ctrl->notifier);
-		dev_err(dev, "Failed to register SSR notification: %d\n", ret);
-		goto remove_ipc_sysfs;
-	}
 
 	ctrl->framer.rootfreq = SLIM_ROOT_FREQ >> 3;
 	ctrl->framer.superfreq =
@@ -2176,6 +2169,24 @@ static int qcom_slim_ngd_ctrl_probe(struct platform_device *pdev)
 	init_completion(&ctrl->xfer_done);
 	init_completion(&ctrl->sync_done);
 
+	/*
+	 * Register the NGD before the SSR and PDR callbacks, which use the
+	 * works it initializes.
+	 */
+	ret = of_qcom_slim_ngd_register(dev, ctrl);
+	if (ret) {
+		SLIM_ERR(ctrl, "qcom_slim_ngd_register failed ret:%d\n", ret);
+		goto remove_ipc_sysfs;
+	}
+
+	ctrl->nb.notifier_call = qcom_slim_ngd_ssr_notify;
+	ctrl->notifier = qcom_register_ssr_notifier("lpass", &ctrl->nb);
+	if (IS_ERR(ctrl->notifier)) {
+		ret = PTR_ERR(ctrl->notifier);
+		dev_err(dev, "Failed to register SSR notification: %d\n", ret);
+		goto err_unregister_ngd;
+	}
+
 	ctrl->pdr = pdr_handle_alloc(slim_pd_status, ctrl);
 	if (IS_ERR(ctrl->pdr)) {
 		ret = dev_err_probe(dev, PTR_ERR(ctrl->pdr),
@@ -2189,12 +2200,6 @@ static int qcom_slim_ngd_ctrl_probe(struct platform_device *pdev)
 		goto err_pdr_lookup;
 	}
 
-	ret = of_qcom_slim_ngd_register(dev, ctrl);
-	if (ret) {
-		SLIM_ERR(ctrl, "qcom_slim_ngd_register failed ret:%d\n", ret);
-		goto err_pdr_lookup;
-	}
-
 	SLIM_INFO(ctrl, "NGD SB controller is up!\n");
 	return 0;
 
@@ -2203,6 +2208,9 @@ err_pdr_lookup:
 
 err_pdr_alloc:
 	qcom_unregister_ssr_notifier(ctrl->notifier, &ctrl->nb);
+
+err_unregister_ngd:
+	qcom_slim_ngd_unregister(ctrl);
 
 remove_ipc_sysfs:
 	if (ctrl->ipc_slimbus_log)
@@ -2218,6 +2226,9 @@ remove_ipc_sysfs:
 static int qcom_slim_ngd_ctrl_remove(struct platform_device *pdev)
 {
 	struct qcom_slim_ngd_ctrl *ctrl = platform_get_drvdata(pdev);
+
+	pdr_handle_release(ctrl->pdr);
+	qcom_unregister_ssr_notifier(ctrl->notifier, &ctrl->nb);
 
 	qcom_slim_ngd_unregister(ctrl);
 	if (ctrl->sysfs_created)
@@ -2236,8 +2247,6 @@ static int qcom_slim_ngd_remove(struct platform_device *pdev)
 
 	pm_runtime_dont_use_autosuspend(&pdev->dev);
 	pm_runtime_disable(&pdev->dev);
-	pdr_handle_release(ctrl->pdr);
-	qcom_unregister_ssr_notifier(ctrl->notifier, &ctrl->nb);
 	slim_unregister_controller(&ctrl->ctrl);
 	qcom_slim_ngd_exit_dma(ctrl);
 	qcom_slim_ngd_qmi_svc_event_deinit(&ctrl->qmi);

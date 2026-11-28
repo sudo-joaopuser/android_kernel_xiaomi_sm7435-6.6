@@ -87,12 +87,8 @@ EXPORT_SYMBOL_GPL(snd_hdac_bus_exit);
 int snd_hdac_bus_exec_verb(struct hdac_bus *bus, unsigned int addr,
 			   unsigned int cmd, unsigned int *res)
 {
-	int err;
-
-	mutex_lock(&bus->cmd_mutex);
-	err = snd_hdac_bus_exec_verb_unlocked(bus, addr, cmd, res);
-	mutex_unlock(&bus->cmd_mutex);
-	return err;
+	guard(mutex)(&bus->cmd_mutex);
+	return snd_hdac_bus_exec_verb_unlocked(bus, addr, cmd, res);
 }
 
 /**
@@ -185,10 +181,13 @@ static void snd_hdac_bus_process_unsol_events(struct work_struct *work)
 		codec = bus->caddr_tbl[caddr & 0x0f];
 		if (!codec || !codec->registered)
 			continue;
-		spin_unlock_irq(&bus->reg_lock);
+		if (!codec->dev.driver)
+			continue;
 		drv = drv_to_hdac_driver(codec->dev.driver);
-		if (drv->unsol_event)
-			drv->unsol_event(codec, res);
+		if (!drv->unsol_event)
+			continue;
+		spin_unlock_irq(&bus->reg_lock);
+		drv->unsol_event(codec, res);
 		spin_lock_irq(&bus->reg_lock);
 	}
 	spin_unlock_irq(&bus->reg_lock);

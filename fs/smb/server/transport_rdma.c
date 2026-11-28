@@ -21,7 +21,7 @@
 #include "glob.h"
 #include "connection.h"
 #include "smb_common.h"
-#include "smbstatus.h"
+#include "../common/smb2status.h"
 #include "transport_rdma.h"
 
 #define SMB_DIRECT_PORT_IWARP		5445
@@ -1388,7 +1388,6 @@ static int smb_direct_rdma_xmit(struct smb_direct_transport *t,
 		if (desc_buf_len > buf_len) {
 			desc_buf_len = buf_len;
 			desc[i].length = cpu_to_le32(desc_buf_len);
-			buf_len = 0;
 		}
 
 		credits_needed += calc_rw_credits(t, desc_buf, desc_buf_len);
@@ -1977,9 +1976,9 @@ static int smb_direct_prepare(struct ksmbd_transport *t)
 		goto out;
 
 	req = (struct smb_direct_negotiate_req *)recvmsg->packet;
-	st->max_recv_size = min_t(int, st->max_recv_size,
+	st->max_recv_size = min_t(u32, st->max_recv_size,
 				  le32_to_cpu(req->preferred_send_size));
-	st->max_send_size = min_t(int, st->max_send_size,
+	st->max_send_size = min_t(u32, st->max_send_size,
 				  le32_to_cpu(req->max_receive_size));
 	st->max_fragmented_send_size =
 		le32_to_cpu(req->max_fragmented_size);
@@ -2206,7 +2205,8 @@ static int smb_direct_ib_client_add(struct ib_device *ib_dev)
 	if (ib_dev->node_type != RDMA_NODE_IB_CA)
 		smb_direct_port = SMB_DIRECT_PORT_IWARP;
 
-	if (!rdma_frwr_is_supported(&ib_dev->attrs))
+	if (!ib_dev->ops.get_netdev ||
+	    !rdma_frwr_is_supported(&ib_dev->attrs))
 		return 0;
 
 	smb_dev = kzalloc(sizeof(*smb_dev), GFP_KERNEL);
@@ -2309,38 +2309,17 @@ bool ksmbd_rdma_capable_netdev(struct net_device *netdev)
 		for (i = 0; i < smb_dev->ib_dev->phys_port_cnt; i++) {
 			struct net_device *ndev;
 
-			if (smb_dev->ib_dev->ops.get_netdev) {
-				ndev = smb_dev->ib_dev->ops.get_netdev(
-					smb_dev->ib_dev, i + 1);
-				if (!ndev)
-					continue;
+			ndev = smb_dev->ib_dev->ops.get_netdev(smb_dev->ib_dev,
+							       i + 1);
+			if (!ndev)
+				continue;
 
-				if (ndev == netdev) {
-					dev_put(ndev);
-					rdma_capable = true;
-					goto out;
-				}
+			if (ndev == netdev) {
 				dev_put(ndev);
-			/* if ib_dev does not implement ops.get_netdev
-			 * check for matching infiniband GUID in hw_addr
-			 */
-			} else if (netdev->type == ARPHRD_INFINIBAND) {
-				struct netdev_hw_addr *ha;
-				union ib_gid gid;
-				u32 port_num;
-				int ret;
-
-				netdev_hw_addr_list_for_each(
-					ha, &netdev->dev_addrs) {
-					memcpy(&gid, ha->addr + 4, sizeof(gid));
-					ret = ib_find_gid(smb_dev->ib_dev, &gid,
-							  &port_num, NULL);
-					if (!ret) {
-						rdma_capable = true;
-						goto out;
-					}
-				}
+				rdma_capable = true;
+				goto out;
 			}
+			dev_put(ndev);
 		}
 	}
 out:

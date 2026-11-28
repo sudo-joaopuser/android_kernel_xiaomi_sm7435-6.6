@@ -4143,21 +4143,19 @@ static int get_implied_cluster_alloc(struct super_block *sb,
 }
 
 /*
- * Determine hole length around the given logical block, first try to
- * locate and expand the hole from the given @path, and then adjust it
- * if it's partially or completely converted to delayed extents, insert
- * it into the extent cache tree if it's indeed a hole, finally return
- * the length of the determined extent.
+ * Adjust the hole [@hole_start, @hole_start + @hole_len) the caller found
+ * around the queried block @lblk if it's partially or completely converted
+ * to delayed extents, insert it into the extent cache tree if it's indeed a
+ * hole, finally return the length of the determined extent starting at
+ * @lblk.  @hole_start must not be behind @lblk.
  */
-static ext4_lblk_t ext4_ext_determine_insert_hole(struct inode *inode,
-						  struct ext4_ext_path *path,
-						  ext4_lblk_t lblk)
+ext4_lblk_t ext4_determine_insert_hole(struct inode *inode, ext4_lblk_t lblk,
+				       ext4_lblk_t hole_start,
+				       ext4_lblk_t hole_len)
 {
-	ext4_lblk_t hole_start, len;
+	ext4_lblk_t len = hole_len;
 	struct extent_status es;
 
-	hole_start = lblk;
-	len = ext4_ext_find_hole(inode, path, &hole_start);
 again:
 	ext4_es_find_extent_range(inode, &ext4_es_is_delayed, hole_start,
 				  hole_start + len - 1, &es);
@@ -4319,9 +4317,11 @@ int ext4_ext_map_blocks(handle_t *handle, struct inode *inode,
 	 * we couldn't try to create block if create flag is zero
 	 */
 	if ((flags & EXT4_GET_BLOCKS_CREATE) == 0) {
-		ext4_lblk_t len;
+		ext4_lblk_t hole_start = map->m_lblk, len;
 
-		len = ext4_ext_determine_insert_hole(inode, path, map->m_lblk);
+		len = ext4_ext_find_hole(inode, path, &hole_start);
+		len = ext4_determine_insert_hole(inode, map->m_lblk,
+						 hole_start, len);
 
 		map->m_pblk = 0;
 		map->m_len = min_t(unsigned int, map->m_len, len);
@@ -6092,12 +6092,9 @@ int ext4_ext_replay_set_iblocks(struct inode *inode)
 	if (IS_ERR(path))
 		return PTR_ERR(path);
 	ex = path[path->p_depth].p_ext;
-	if (!ex) {
-		ext4_free_ext_path(path);
+	if (!ex)
 		goto out;
-	}
 	end = le32_to_cpu(ex->ee_block) + ext4_ext_get_actual_len(ex);
-	ext4_free_ext_path(path);
 
 	/* Count the number of data blocks */
 	cur = 0;
@@ -6123,32 +6120,28 @@ int ext4_ext_replay_set_iblocks(struct inode *inode)
 	ret = skip_hole(inode, &cur);
 	if (ret < 0)
 		goto out;
-	path = ext4_find_extent(inode, cur, NULL, 0);
+	path = ext4_find_extent(inode, cur, path, 0);
 	if (IS_ERR(path))
 		goto out;
 	numblks += path->p_depth;
-	ext4_free_ext_path(path);
 	while (cur < end) {
-		path = ext4_find_extent(inode, cur, NULL, 0);
+		path = ext4_find_extent(inode, cur, path, 0);
 		if (IS_ERR(path))
 			break;
 		ex = path[path->p_depth].p_ext;
-		if (!ex) {
-			ext4_free_ext_path(path);
-			return 0;
-		}
+		if (!ex)
+			goto cleanup;
+
 		cur = max(cur + 1, le32_to_cpu(ex->ee_block) +
 					ext4_ext_get_actual_len(ex));
 		ret = skip_hole(inode, &cur);
-		if (ret < 0) {
-			ext4_free_ext_path(path);
+		if (ret < 0)
 			break;
-		}
-		path2 = ext4_find_extent(inode, cur, NULL, 0);
-		if (IS_ERR(path2)) {
-			ext4_free_ext_path(path);
+
+		path2 = ext4_find_extent(inode, cur, path2, 0);
+		if (IS_ERR(path2))
 			break;
-		}
+
 		for (i = 0; i <= max(path->p_depth, path2->p_depth); i++) {
 			cmp1 = cmp2 = 0;
 			if (i <= path->p_depth)
@@ -6160,13 +6153,14 @@ int ext4_ext_replay_set_iblocks(struct inode *inode)
 			if (cmp1 != cmp2 && cmp2 != 0)
 				numblks++;
 		}
-		ext4_free_ext_path(path);
-		ext4_free_ext_path(path2);
 	}
 
 out:
 	inode->i_blocks = numblks << (inode->i_sb->s_blocksize_bits - 9);
 	ext4_mark_inode_dirty(NULL, inode);
+cleanup:
+	ext4_free_ext_path(path);
+	ext4_free_ext_path(path2);
 	return 0;
 }
 
@@ -6187,12 +6181,9 @@ int ext4_ext_clear_bb(struct inode *inode)
 	if (IS_ERR(path))
 		return PTR_ERR(path);
 	ex = path[path->p_depth].p_ext;
-	if (!ex) {
-		ext4_free_ext_path(path);
-		return 0;
-	}
+	if (!ex)
+		goto out;
 	end = le32_to_cpu(ex->ee_block) + ext4_ext_get_actual_len(ex);
-	ext4_free_ext_path(path);
 
 	cur = 0;
 	while (cur < end) {
@@ -6202,23 +6193,25 @@ int ext4_ext_clear_bb(struct inode *inode)
 		if (ret < 0)
 			break;
 		if (ret > 0) {
-			path = ext4_find_extent(inode, map.m_lblk, NULL, 0);
-			if (!IS_ERR_OR_NULL(path)) {
+			path = ext4_find_extent(inode, map.m_lblk, path, 0);
+			if (!IS_ERR(path)) {
 				for (j = 0; j < path->p_depth; j++) {
-
 					ext4_mb_mark_bb(inode->i_sb,
-							path[j].p_block, 1, 0);
+							path[j].p_block, 1, false);
 					ext4_fc_record_regions(inode->i_sb, inode->i_ino,
 							0, path[j].p_block, 1, 1);
 				}
-				ext4_free_ext_path(path);
+			} else {
+				path = NULL;
 			}
-			ext4_mb_mark_bb(inode->i_sb, map.m_pblk, map.m_len, 0);
+			ext4_mb_mark_bb(inode->i_sb, map.m_pblk, map.m_len, false);
 			ext4_fc_record_regions(inode->i_sb, inode->i_ino,
 					map.m_lblk, map.m_pblk, map.m_len, 1);
 		}
 		cur = cur + map.m_len;
 	}
 
+out:
+	ext4_free_ext_path(path);
 	return 0;
 }

@@ -133,11 +133,11 @@ u16 blk_to_nvme_status(struct nvmet_req *req, blk_status_t blk_sts)
 	 */
 	switch (blk_sts) {
 	case BLK_STS_NOSPC:
-		status = NVME_SC_CAP_EXCEEDED | NVME_SC_DNR;
+		status = NVME_SC_CAP_EXCEEDED | NVME_STATUS_DNR;
 		req->error_loc = offsetof(struct nvme_rw_command, length);
 		break;
 	case BLK_STS_TARGET:
-		status = NVME_SC_LBA_RANGE | NVME_SC_DNR;
+		status = NVME_SC_LBA_RANGE | NVME_STATUS_DNR;
 		req->error_loc = offsetof(struct nvme_rw_command, slba);
 		break;
 	case BLK_STS_NOTSUPP:
@@ -145,10 +145,10 @@ u16 blk_to_nvme_status(struct nvmet_req *req, blk_status_t blk_sts)
 		switch (req->cmd->common.opcode) {
 		case nvme_cmd_dsm:
 		case nvme_cmd_write_zeroes:
-			status = NVME_SC_ONCS_NOT_SUPPORTED | NVME_SC_DNR;
+			status = NVME_SC_ONCS_NOT_SUPPORTED | NVME_STATUS_DNR;
 			break;
 		default:
-			status = NVME_SC_INVALID_OPCODE | NVME_SC_DNR;
+			status = NVME_SC_INVALID_OPCODE | NVME_STATUS_DNR;
 		}
 		break;
 	case BLK_STS_MEDIUM:
@@ -157,7 +157,7 @@ u16 blk_to_nvme_status(struct nvmet_req *req, blk_status_t blk_sts)
 		break;
 	case BLK_STS_IOERR:
 	default:
-		status = NVME_SC_INTERNAL | NVME_SC_DNR;
+		status = NVME_SC_INTERNAL | NVME_STATUS_DNR;
 		req->error_loc = offsetof(struct nvme_common_command, opcode);
 	}
 
@@ -300,7 +300,7 @@ static void nvmet_bdev_execute_rw(struct nvmet_req *req)
 							  &prot_miter);
 				if (unlikely(rc)) {
 					bio_io_error(bio);
-					return;
+					goto out_plug;
 				}
 			}
 
@@ -320,11 +320,12 @@ static void nvmet_bdev_execute_rw(struct nvmet_req *req)
 		rc = nvmet_bdev_alloc_bip(req, bio, &prot_miter);
 		if (unlikely(rc)) {
 			bio_io_error(bio);
-			return;
+			goto out_plug;
 		}
 	}
 
 	submit_bio(bio);
+out_plug:
 	blk_finish_plug(&plug);
 }
 
@@ -354,33 +355,18 @@ u16 nvmet_bdev_flush(struct nvmet_req *req)
 		return 0;
 
 	if (blkdev_issue_flush(req->ns->bdev))
-		return NVME_SC_INTERNAL | NVME_SC_DNR;
+		return NVME_SC_INTERNAL | NVME_STATUS_DNR;
 	return 0;
-}
-
-static u16 nvmet_bdev_discard_range(struct nvmet_req *req,
-		struct nvme_dsm_range *range, struct bio **bio)
-{
-	struct nvmet_ns *ns = req->ns;
-	int ret;
-
-	ret = __blkdev_issue_discard(ns->bdev,
-			nvmet_lba_to_sect(ns, range->slba),
-			le32_to_cpu(range->nlb) << (ns->blksize_shift - 9),
-			GFP_KERNEL, bio);
-	if (ret && ret != -EOPNOTSUPP) {
-		req->error_slba = le64_to_cpu(range->slba);
-		return errno_to_nvme_status(req, ret);
-	}
-	return NVME_SC_SUCCESS;
 }
 
 static void nvmet_bdev_execute_discard(struct nvmet_req *req)
 {
+	struct nvmet_ns *ns = req->ns;
 	struct nvme_dsm_range range;
 	struct bio *bio = NULL;
+	sector_t nr_sects;
 	int i;
-	u16 status;
+	u16 status = NVME_SC_SUCCESS;
 
 	for (i = 0; i <= le32_to_cpu(req->cmd->dsm.nr); i++) {
 		status = nvmet_copy_from_sgl(req, i * sizeof(range), &range,
@@ -388,9 +374,11 @@ static void nvmet_bdev_execute_discard(struct nvmet_req *req)
 		if (status)
 			break;
 
-		status = nvmet_bdev_discard_range(req, &range, &bio);
-		if (status)
-			break;
+		nr_sects = (sector_t)le32_to_cpu(range.nlb) <<
+			   (ns->blksize_shift - 9);
+		__blkdev_issue_discard(ns->bdev,
+				nvmet_lba_to_sect(ns, range.slba), nr_sects,
+				GFP_KERNEL, &bio);
 	}
 
 	if (bio) {

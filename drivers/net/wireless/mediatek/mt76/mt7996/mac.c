@@ -102,7 +102,6 @@ static void mt7996_mac_sta_poll(struct mt7996_dev *dev)
 	};
 	struct ieee80211_sta *sta;
 	struct mt7996_sta *msta;
-	struct rate_info *rate;
 	u32 tx_time[IEEE80211_NUM_ACS], rx_time[IEEE80211_NUM_ACS];
 	LIST_HEAD(sta_poll_list);
 	int i;
@@ -118,7 +117,6 @@ static void mt7996_mac_sta_poll(struct mt7996_dev *dev)
 		u32 addr, val;
 		u16 idx;
 		s8 rssi[4];
-		u8 bw;
 
 		spin_lock_bh(&dev->mt76.sta_poll_lock);
 		if (list_empty(&sta_poll_list)) {
@@ -172,49 +170,6 @@ static void mt7996_mac_sta_poll(struct mt7996_dev *dev)
 				continue;
 
 			ieee80211_sta_register_airtime(sta, tid, tx_cur, rx_cur);
-		}
-
-		/* We don't support reading GI info from txs packets.
-		 * For accurate tx status reporting and AQL improvement,
-		 * we need to make sure that flags match so polling GI
-		 * from per-sta counters directly.
-		 */
-		rate = &msta->wcid.rate;
-
-		switch (rate->bw) {
-		case RATE_INFO_BW_320:
-			bw = IEEE80211_STA_RX_BW_320;
-			break;
-		case RATE_INFO_BW_160:
-			bw = IEEE80211_STA_RX_BW_160;
-			break;
-		case RATE_INFO_BW_80:
-			bw = IEEE80211_STA_RX_BW_80;
-			break;
-		case RATE_INFO_BW_40:
-			bw = IEEE80211_STA_RX_BW_40;
-			break;
-		default:
-			bw = IEEE80211_STA_RX_BW_20;
-			break;
-		}
-
-		addr = mt7996_mac_wtbl_lmac_addr(dev, idx, 6);
-		val = mt76_rr(dev, addr);
-		if (rate->flags & RATE_INFO_FLAGS_EHT_MCS) {
-			addr = mt7996_mac_wtbl_lmac_addr(dev, idx, 5);
-			val = mt76_rr(dev, addr);
-			rate->eht_gi = FIELD_GET(GENMASK(25, 24), val);
-		} else if (rate->flags & RATE_INFO_FLAGS_HE_MCS) {
-			u8 offs = 24 + 2 * bw;
-
-			rate->he_gi = (val & (0x3 << offs)) >> offs;
-		} else if (rate->flags &
-			   (RATE_INFO_FLAGS_VHT_MCS | RATE_INFO_FLAGS_MCS)) {
-			if (val & BIT(12 + bw))
-				rate->flags |= RATE_INFO_FLAGS_SHORT_GI;
-			else
-				rate->flags &= ~RATE_INFO_FLAGS_SHORT_GI;
 		}
 
 		/* get signal strength of resp frames (CTS/BA/ACK) */
@@ -479,7 +434,13 @@ mt7996_mac_fill_rx(struct mt7996_dev *dev, struct sk_buff *skb)
 	memset(status, 0, sizeof(*status));
 
 	band_idx = FIELD_GET(MT_RXD1_NORMAL_BAND_IDX, rxd1);
+	if (band_idx >= __MT_MAX_BAND)
+		return -EINVAL;
+
 	mphy = dev->mt76.phys[band_idx];
+	if (!mphy)
+		return -EINVAL;
+
 	phy = mphy->priv;
 	status->phy_idx = mphy->band_idx;
 
@@ -1240,6 +1201,8 @@ mt7996_mac_add_txs_skb(struct mt7996_dev *dev, struct mt76_wcid *wcid,
 			goto out;
 
 		rate.flags = RATE_INFO_FLAGS_VHT_MCS;
+		if (wcid->rate.flags & RATE_INFO_FLAGS_SHORT_GI)
+			rate.flags |= RATE_INFO_FLAGS_SHORT_GI;
 		break;
 	case MT_PHY_TYPE_HE_SU:
 	case MT_PHY_TYPE_HE_EXT_SU:
@@ -1737,6 +1700,7 @@ mt7996_mac_full_reset(struct mt7996_dev *dev)
 	phy3 = mt7996_phy3(dev);
 	dev->recovery.hw_full_reset = true;
 
+	set_bit(MT76_MCU_RESET, &dev->mphy.state);
 	wake_up(&dev->mt76.mcu.wait);
 	ieee80211_stop_queues(mt76_hw(dev));
 	if (phy2)
@@ -1844,12 +1808,13 @@ void mt7996_mac_reset_work(struct work_struct *work)
 		set_bit(MT76_RESET, &phy3->mt76->state);
 		cancel_delayed_work_sync(&phy3->mt76->mac_work);
 	}
+
+	mutex_lock(&dev->mt76.mutex);
+
 	mt76_worker_disable(&dev->mt76.tx_worker);
 	mt76_for_each_q_rx(&dev->mt76, i)
 		napi_disable(&dev->mt76.napi[i]);
 	napi_disable(&dev->mt76.tx_napi);
-
-	mutex_lock(&dev->mt76.mutex);
 
 	mt76_wr(dev, MT_MCU_INT_EVENT, MT_MCU_INT_EVENT_DMA_STOPPED);
 
@@ -2201,6 +2166,12 @@ void mt7996_mac_work(struct work_struct *work)
 		mphy->mac_work_count = 0;
 
 		mt7996_mac_update_stats(phy);
+
+		mt7996_mcu_get_all_sta_info(phy, UNI_ALL_STA_TXRX_RATE);
+		if (mtk_wed_device_active(&phy->dev->mt76.mmio.wed)) {
+			mt7996_mcu_get_all_sta_info(phy, UNI_ALL_STA_TXRX_ADM_STAT);
+			mt7996_mcu_get_all_sta_info(phy, UNI_ALL_STA_TXRX_MSDU_COUNT);
+		}
 	}
 
 	mutex_unlock(&mphy->dev->mutex);
@@ -2543,8 +2514,10 @@ void mt7996_mac_add_twt_setup(struct ieee80211_hw *hw,
 	}
 	flow->tsf = le64_to_cpu(twt_agrt->twt);
 
-	if (mt7996_mcu_twt_agrt_update(dev, msta->vif, flow, MCU_TWT_AGRT_ADD))
+	if (mt7996_mcu_twt_agrt_update(dev, msta->vif, flow, MCU_TWT_AGRT_ADD)) {
+		list_del(&flow->list);
 		goto unlock;
+	}
 
 	setup_cmd = TWT_SETUP_CMD_ACCEPT;
 	dev->twt.table_mask |= BIT(table_id);

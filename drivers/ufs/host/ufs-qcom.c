@@ -2075,8 +2075,21 @@ static int ufs_qcom_suspend(struct ufs_hba *hba, enum ufs_pm_op pm_op,
 			err = ufs_qcom_unvote_qos_all(hba);
 	}
 
-	if (!err && ufs_qcom_is_link_off(hba) && host->device_reset)
+	if (!err && ufs_qcom_is_link_off(hba) && host->device_reset) {
 		ufs_qcom_device_reset_ctrl(hba, true);
+		/*
+		 * After sending the SSU command, asserting the rst_n
+		 * line causes the device firmware to wake up and
+		 * execute its reset routine.
+		 *
+		 * During this process, the device may draw current
+		 * beyond the permissible limit for low-power mode (LPM).
+		 * A 10ms delay, based on experimental observations,
+		 * allows the UFS device to complete its hardware reset
+		 * before transitioning the power rail to LPM.
+		 */
+		usleep_range(10000, 11000);
+	}
 
 	/* put a proxy vote on UFS VCCQ LDO in shutdown case */
 	if (pm_op == UFS_SHUTDOWN_PM)

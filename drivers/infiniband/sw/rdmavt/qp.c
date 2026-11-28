@@ -92,12 +92,10 @@ static int rvt_wss_llc_size(void)
 static void cacheless_memcpy(void *dst, void *src, size_t n)
 {
 	/*
-	 * Use the only available X64 cacheless copy.  Add a __user cast
-	 * to quiet sparse.  The src agument is already in the kernel so
-	 * there are no security issues.  The extra fault recovery machinery
-	 * is not invoked.
+	 * Use the only available X64 cacheless copy.
+	 * The extra fault recovery machinery is not invoked.
 	 */
-	__copy_user_nocache(dst, (void __user *)src, n);
+	copy_to_nontemporal(dst, src, n);
 }
 
 void rvt_wss_exit(struct rvt_dev_info *rdi)
@@ -1177,7 +1175,7 @@ int rvt_create_qp(struct ib_qp *ibqp, struct ib_qp_init_attr *init_attr,
 		if (rdi->driver_f.qp_priv_init) {
 			ret = rdi->driver_f.qp_priv_init(rdi, qp, init_attr);
 			if (ret)
-				goto bail_rq_wq;
+				goto bail_qpn;
 		}
 		break;
 
