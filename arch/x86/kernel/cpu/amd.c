@@ -594,9 +594,14 @@ static void tsa_init(struct cpuinfo_x86 *c)
 		if (amd_check_tsa_microcode())
 			setup_force_cpu_cap(X86_FEATURE_VERW_CLEAR);
 	} else {
-		setup_force_cpu_cap(X86_FEATURE_TSA_SQ_NO);
-		setup_force_cpu_cap(X86_FEATURE_TSA_L1_NO);
+		if (!cpu_has(c, X86_FEATURE_ZEN5)) {
+			setup_force_cpu_cap(X86_FEATURE_TSA_SQ_NO);
+			setup_force_cpu_cap(X86_FEATURE_TSA_L1_NO);
+		}
 	}
+
+	if (!cpu_has(c, X86_FEATURE_ZEN5))
+		setup_force_cpu_cap(X86_FEATURE_TSA_FILL_NO);
 }
 
 static void bsp_init_amd(struct cpuinfo_x86 *c)
@@ -669,7 +674,7 @@ static void bsp_init_amd(struct cpuinfo_x86 *c)
 
 	/* Figure out Zen generations: */
 	switch (c->x86) {
-	case 0x17: {
+	case 0x17:
 		switch (c->x86_model) {
 		case 0x00 ... 0x2f:
 		case 0x50 ... 0x5f:
@@ -685,8 +690,8 @@ static void bsp_init_amd(struct cpuinfo_x86 *c)
 			goto warn;
 		}
 		break;
-	}
-	case 0x19: {
+
+	case 0x19:
 		switch (c->x86_model) {
 		case 0x00 ... 0x0f:
 		case 0x20 ... 0x5f:
@@ -700,7 +705,26 @@ static void bsp_init_amd(struct cpuinfo_x86 *c)
 			goto warn;
 		}
 		break;
-	}
+
+	case 0x1a:
+		switch (c->x86_model) {
+		case 0x00 ... 0x2f:
+		case 0x40 ... 0x4f:
+		case 0x60 ... 0x7f:
+		case 0xd0 ... 0xd7:
+			setup_force_cpu_cap(X86_FEATURE_ZEN5);
+			break;
+		case 0x50 ... 0x5f:
+		case 0x80 ... 0xaf:
+		case 0xc0 ... 0xcf:
+		case 0xd8 ... 0xef:
+			setup_force_cpu_cap(X86_FEATURE_ZEN6);
+			break;
+		default:
+			goto warn;
+		}
+		break;
+
 	default:
 		break;
 	}
@@ -1183,6 +1207,22 @@ static void init_amd_zen3(struct cpuinfo_x86 *c)
 static void init_amd_zen4(struct cpuinfo_x86 *c)
 {
 	init_amd_zen_common();
+
+	/*
+	 * These Zen4 SoCs advertise support for virtualized VMLOAD/VMSAVE
+	 * in some BIOS versions but they can lead to random host reboots.
+	 */
+	switch (c->x86_model) {
+	case 0x18 ... 0x1f:
+	case 0x60 ... 0x7f:
+		clear_cpu_cap(c, X86_FEATURE_V_VMSAVE_VMLOAD);
+		break;
+	}
+}
+
+static void init_amd_zen5(struct cpuinfo_x86 *c)
+{
+	init_amd_zen_common();
 }
 
 static void init_amd(struct cpuinfo_x86 *c)
@@ -1228,6 +1268,8 @@ static void init_amd(struct cpuinfo_x86 *c)
 		init_amd_zen3(c);
 	else if (boot_cpu_has(X86_FEATURE_ZEN4))
 		init_amd_zen4(c);
+	else if (boot_cpu_has(X86_FEATURE_ZEN5))
+		init_amd_zen5(c);
 
 	/*
 	 * Enable workaround for FXSAVE leak on CPUs

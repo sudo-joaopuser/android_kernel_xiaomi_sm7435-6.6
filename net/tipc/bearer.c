@@ -482,6 +482,7 @@ void tipc_disable_l2_media(struct tipc_bearer *b)
 	dev = (struct net_device *)rtnl_dereference(b->media_ptr);
 	dev_remove_pack(&b->pt);
 	RCU_INIT_POINTER(dev->tipc_ptr, NULL);
+	RCU_INIT_POINTER(b->media_ptr, NULL);
 	synchronize_net();
 	dev_put(dev);
 }
@@ -657,6 +658,10 @@ static int tipc_l2_rcv_msg(struct sk_buff *skb, struct net_device *dev,
 			   struct packet_type *pt, struct net_device *orig_dev)
 {
 	struct tipc_bearer *b;
+
+	skb = skb_share_check(skb, GFP_ATOMIC);
+	if (!skb)
+		return NET_RX_DROP;
 
 	rcu_read_lock();
 	b = rcu_dereference(dev->tipc_ptr) ?:

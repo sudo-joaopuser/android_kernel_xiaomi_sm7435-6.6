@@ -120,7 +120,7 @@ static const struct i2c_hid_quirks {
 	__u32 quirks;
 } i2c_hid_quirks[] = {
 	{ I2C_VENDOR_ID_HANTICK, I2C_PRODUCT_ID_HANTICK_5288,
-		I2C_HID_QUIRK_NO_IRQ_AFTER_RESET },
+		I2C_HID_QUIRK_NO_IRQ_AFTER_RESET | I2C_HID_QUIRK_BAD_INPUT_SIZE },
 	{ I2C_VENDOR_ID_ITE, I2C_DEVICE_ID_ITE_VOYO_WINPAD_A15,
 		I2C_HID_QUIRK_NO_IRQ_AFTER_RESET },
 	{ I2C_VENDOR_ID_RAYDIUM, I2C_PRODUCT_ID_RAYDIUM_3118,
@@ -133,6 +133,8 @@ static const struct i2c_hid_quirks {
 		I2C_HID_QUIRK_BAD_INPUT_SIZE },
 	{ I2C_VENDOR_ID_CIRQUE, I2C_PRODUCT_ID_CIRQUE_1063,
 		I2C_HID_QUIRK_NO_SLEEP_ON_SUSPEND },
+	{ I2C_VENDOR_ID_CIRQUE, I2C_PRODUCT_ID_CIRQUE_D0C1,
+		I2C_HID_QUIRK_NO_IRQ_AFTER_RESET },
 	/*
 	 * Sending the wakeup after reset actually break ELAN touchscreen controller
 	 */
@@ -420,12 +422,23 @@ set_pwr_exit:
 	return ret;
 }
 
-static int i2c_hid_execute_reset(struct i2c_hid *ihid)
+static int i2c_hid_start_hwreset(struct i2c_hid *ihid)
 {
 	size_t length = 0;
 	int ret;
 
-	i2c_hid_dbg(ihid, "resetting...\n");
+	i2c_hid_dbg(ihid, "%s\n", __func__);
+
+	/*
+	 * This prevents sending feature reports while the device is
+	 * being reset. Otherwise we may lose the reset complete
+	 * interrupt.
+	 */
+	lockdep_assert_held(&ihid->reset_lock);
+
+	ret = i2c_hid_set_power(ihid, I2C_HID_PWR_ON);
+	if (ret)
+		return ret;
 
 	/* Prepare reset command. Command register goes first. */
 	*(__le16 *)ihid->cmdbuf = ihid->hdesc.wCommandRegister;
@@ -438,60 +451,45 @@ static int i2c_hid_execute_reset(struct i2c_hid *ihid)
 
 	ret = i2c_hid_xfer(ihid, ihid->cmdbuf, length, NULL, 0);
 	if (ret) {
-		dev_err(&ihid->client->dev, "failed to reset device.\n");
-		goto out;
+		dev_err(&ihid->client->dev,
+			"failed to reset device: %d\n", ret);
+		goto err_clear_reset;
 	}
 
-	if (ihid->quirks & I2C_HID_QUIRK_NO_IRQ_AFTER_RESET) {
-		msleep(100);
-		goto out;
-	}
+	return 0;
 
-	i2c_hid_dbg(ihid, "%s: waiting...\n", __func__);
-	if (!wait_event_timeout(ihid->wait,
-				!test_bit(I2C_HID_RESET_PENDING, &ihid->flags),
-				msecs_to_jiffies(5000))) {
-		ret = -ENODATA;
-		goto out;
-	}
-	i2c_hid_dbg(ihid, "%s: finished.\n", __func__);
-
-out:
+err_clear_reset:
 	clear_bit(I2C_HID_RESET_PENDING, &ihid->flags);
+	i2c_hid_set_power(ihid, I2C_HID_PWR_SLEEP);
 	return ret;
 }
 
-static int i2c_hid_hwreset(struct i2c_hid *ihid)
+static int i2c_hid_finish_hwreset(struct i2c_hid *ihid)
 {
-	int ret;
+	int ret = 0;
 
-	i2c_hid_dbg(ihid, "%s\n", __func__);
+	i2c_hid_dbg(ihid, "%s: waiting...\n", __func__);
 
-	/*
-	 * This prevents sending feature reports while the device is
-	 * being reset. Otherwise we may lose the reset complete
-	 * interrupt.
-	 */
-	mutex_lock(&ihid->reset_lock);
-
-	ret = i2c_hid_set_power(ihid, I2C_HID_PWR_ON);
-	if (ret)
-		goto out_unlock;
-
-	ret = i2c_hid_execute_reset(ihid);
-	if (ret) {
-		dev_err(&ihid->client->dev,
-			"failed to reset device: %d\n", ret);
-		i2c_hid_set_power(ihid, I2C_HID_PWR_SLEEP);
-		goto out_unlock;
+	if (ihid->quirks & I2C_HID_QUIRK_NO_IRQ_AFTER_RESET) {
+		msleep(100);
+		clear_bit(I2C_HID_RESET_PENDING, &ihid->flags);
+	} else if (!wait_event_timeout(ihid->wait,
+				       !test_bit(I2C_HID_RESET_PENDING, &ihid->flags),
+				       msecs_to_jiffies(5000))) {
+		ret = -ENODATA;
+		goto err_clear_reset;
 	}
+	i2c_hid_dbg(ihid, "%s: finished.\n", __func__);
 
 	/* At least some SIS devices need this after reset */
 	if (!(ihid->quirks & I2C_HID_QUIRK_NO_WAKEUP_AFTER_RESET))
 		ret = i2c_hid_set_power(ihid, I2C_HID_PWR_ON);
 
-out_unlock:
-	mutex_unlock(&ihid->reset_lock);
+	return ret;
+
+err_clear_reset:
+	clear_bit(I2C_HID_RESET_PENDING, &ihid->flags);
+	i2c_hid_set_power(ihid, I2C_HID_PWR_SLEEP);
 	return ret;
 }
 
@@ -548,9 +546,10 @@ static void i2c_hid_get_input(struct i2c_hid *ihid)
 		if (ihid->hid->group != HID_GROUP_RMI)
 			pm_wakeup_event(&ihid->client->dev, 0);
 
-		hid_input_report(ihid->hid, HID_INPUT_REPORT,
-				ihid->inbuf + sizeof(__le16),
-				ret_size - sizeof(__le16), 1);
+		hid_safe_input_report(ihid->hid, HID_INPUT_REPORT,
+				      ihid->inbuf + sizeof(__le16),
+				      ihid->bufsize - sizeof(__le16),
+				      ret_size - sizeof(__le16), 1);
 	}
 
 	return;
@@ -720,11 +719,10 @@ static int i2c_hid_parse(struct hid_device *hid)
 	struct i2c_client *client = hid->driver_data;
 	struct i2c_hid *ihid = i2c_get_clientdata(client);
 	struct i2c_hid_desc *hdesc = &ihid->hdesc;
+	char *rdesc = NULL, *use_override = NULL;
 	unsigned int rsize;
-	char *rdesc;
 	int ret;
 	int tries = 3;
-	char *use_override;
 
 	i2c_hid_dbg(ihid, "entering %s\n", __func__);
 
@@ -734,11 +732,15 @@ static int i2c_hid_parse(struct hid_device *hid)
 		return -EINVAL;
 	}
 
+	mutex_lock(&ihid->reset_lock);
 	do {
-		ret = i2c_hid_hwreset(ihid);
-		if (ret)
+		ret = i2c_hid_start_hwreset(ihid);
+		if (ret == 0)
+			ret = i2c_hid_finish_hwreset(ihid);
+		else
 			msleep(1000);
 	} while (tries-- > 0 && ret);
+	mutex_unlock(&ihid->reset_lock);
 
 	if (ret)
 		return ret;
@@ -751,11 +753,8 @@ static int i2c_hid_parse(struct hid_device *hid)
 		i2c_hid_dbg(ihid, "Using a HID report descriptor override\n");
 	} else {
 		rdesc = kzalloc(rsize, GFP_KERNEL);
-
-		if (!rdesc) {
-			dbg_hid("couldn't allocate rdesc memory\n");
+		if (!rdesc)
 			return -ENOMEM;
-		}
 
 		i2c_hid_dbg(ihid, "asking HID report descriptor\n");
 
@@ -763,24 +762,22 @@ static int i2c_hid_parse(struct hid_device *hid)
 					    ihid->hdesc.wReportDescRegister,
 					    rdesc, rsize);
 		if (ret) {
-			hid_err(hid, "reading report descriptor failed\n");
-			kfree(rdesc);
-			return -EIO;
+			dev_err(&client->dev, "reading report descriptor failed\n");
+			goto out;
 		}
 	}
 
 	i2c_hid_dbg(ihid, "Report Descriptor: %*ph\n", rsize, rdesc);
 
 	ret = hid_parse_report(hid, rdesc, rsize);
+	if (ret)
+		dbg_hid("parsing report descriptor failed\n");
+
+out:
 	if (!use_override)
 		kfree(rdesc);
 
-	if (ret) {
-		dbg_hid("parsing report descriptor failed\n");
-		return ret;
-	}
-
-	return 0;
+	return ret;
 }
 
 static int i2c_hid_start(struct hid_device *hid)
@@ -987,10 +984,15 @@ static int i2c_hid_core_resume(struct i2c_hid *ihid)
 	 * However some ALPS touchpads generate IRQ storm without reset, so
 	 * let's still reset them here.
 	 */
-	if (ihid->quirks & I2C_HID_QUIRK_RESET_ON_RESUME)
-		ret = i2c_hid_hwreset(ihid);
-	else
+	if (ihid->quirks & I2C_HID_QUIRK_RESET_ON_RESUME) {
+		mutex_lock(&ihid->reset_lock);
+		ret = i2c_hid_start_hwreset(ihid);
+		if (ret == 0)
+			ret = i2c_hid_finish_hwreset(ihid);
+		mutex_unlock(&ihid->reset_lock);
+	} else {
 		ret = i2c_hid_set_power(ihid, I2C_HID_PWR_ON);
+	}
 
 	if (ret)
 		return ret;
@@ -1300,7 +1302,16 @@ void i2c_hid_core_shutdown(struct i2c_client *client)
 {
 	struct i2c_hid *ihid = i2c_get_clientdata(client);
 
-	i2c_hid_set_power(ihid, I2C_HID_PWR_SLEEP);
+	/*
+	 * Like in i2c_hid_core_remove(): if we're a follower, the act of
+	 * unfollowing will cause us to be powered down. Otherwise we need to
+	 * manually do it.
+	 */
+	if (ihid->is_panel_follower)
+		drm_panel_remove_follower(&ihid->panel_follower);
+	else
+		i2c_hid_set_power(ihid, I2C_HID_PWR_SLEEP);
+
 	free_irq(client->irq, ihid);
 
 	i2c_hid_core_shutdown_tail(ihid);

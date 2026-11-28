@@ -53,13 +53,22 @@ static u16 nvmet_passthru_override_id_descs(struct nvmet_req *req)
 	for (pos = 0; pos < NVME_IDENTIFY_DATA_SIZE; pos += len) {
 		struct nvme_ns_id_desc *cur = data + pos;
 
+		if (pos + sizeof(*cur) > NVME_IDENTIFY_DATA_SIZE)
+			break;
+
 		if (cur->nidl == 0)
 			break;
+
 		if (cur->nidt == NVME_NIDT_CSI) {
+			if (pos + sizeof(*cur) + NVME_NIDT_CSI_LEN >
+						NVME_IDENTIFY_DATA_SIZE)
+				break;
+
 			memcpy(&csi, cur + 1, NVME_NIDT_CSI_LEN);
 			csi_seen = true;
 			break;
 		}
+
 		len = sizeof(struct nvme_ns_id_desc) + cur->nidl;
 	}
 
@@ -306,7 +315,7 @@ static void nvmet_passthru_execute_cmd(struct nvmet_req *req)
 		ns = nvme_find_get_ns(ctrl, nsid);
 		if (unlikely(!ns)) {
 			pr_err("failed to get passthru ns nsid:%u\n", nsid);
-			status = NVME_SC_INVALID_NS | NVME_SC_DNR;
+			status = NVME_SC_INVALID_NS | NVME_STATUS_DNR;
 			goto out;
 		}
 
@@ -426,7 +435,7 @@ u16 nvmet_parse_passthru_io_cmd(struct nvmet_req *req)
 		 * emulated in the future if regular targets grow support for
 		 * this feature.
 		 */
-		return NVME_SC_INVALID_OPCODE | NVME_SC_DNR;
+		return NVME_SC_INVALID_OPCODE | NVME_STATUS_DNR;
 	}
 
 	return nvmet_setup_passthru_command(req);
@@ -478,7 +487,7 @@ static u16 nvmet_passthru_get_set_features(struct nvmet_req *req)
 	case NVME_FEAT_RESV_PERSIST:
 		/* No reservations, see nvmet_parse_passthru_io_cmd() */
 	default:
-		return NVME_SC_INVALID_OPCODE | NVME_SC_DNR;
+		return NVME_SC_INVALID_OPCODE | NVME_STATUS_DNR;
 	}
 }
 
@@ -546,7 +555,7 @@ u16 nvmet_parse_passthru_admin_cmd(struct nvmet_req *req)
 				req->p.use_workqueue = true;
 				return NVME_SC_SUCCESS;
 			}
-			return NVME_SC_INVALID_OPCODE | NVME_SC_DNR;
+			return NVME_SC_INVALID_OPCODE | NVME_STATUS_DNR;
 		case NVME_ID_CNS_NS:
 			req->execute = nvmet_passthru_execute_cmd;
 			req->p.use_workqueue = true;
@@ -558,7 +567,7 @@ u16 nvmet_parse_passthru_admin_cmd(struct nvmet_req *req)
 				req->p.use_workqueue = true;
 				return NVME_SC_SUCCESS;
 			}
-			return NVME_SC_INVALID_OPCODE | NVME_SC_DNR;
+			return NVME_SC_INVALID_OPCODE | NVME_STATUS_DNR;
 		default:
 			return nvmet_setup_passthru_command(req);
 		}

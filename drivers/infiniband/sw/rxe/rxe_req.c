@@ -110,7 +110,7 @@ void rnr_nak_timer(struct timer_list *t)
 		/* request a send queue retry */
 		qp->req.need_retry = 1;
 		qp->req.wait_for_rnr_timer = 0;
-		rxe_sched_task(&qp->req.task);
+		rxe_sched_task(&qp->send_task);
 	}
 	spin_unlock_irqrestore(&qp->state_lock, flags);
 	rxe_put(qp);
@@ -511,7 +511,14 @@ static int finish_packet(struct rxe_qp *qp, struct rxe_av *av,
 
 	if (pkt->mask & RXE_WRITE_OR_SEND_MASK) {
 		if (wqe->wr.send_flags & IB_SEND_INLINE) {
-			u8 *tmp = &wqe->dma.inline_data[wqe->dma.sge_offset];
+			u32 sge_offset = READ_ONCE(wqe->dma.sge_offset);
+			u8 *tmp;
+
+			if (unlikely(sge_offset > (u32)qp->sq.max_inline ||
+				     payload > (u32)qp->sq.max_inline - sge_offset))
+				return -EINVAL;
+
+			tmp = &wqe->dma.inline_data[sge_offset];
 
 			memcpy(payload_addr(pkt), tmp, payload);
 
@@ -663,7 +670,7 @@ static int rxe_do_local_ops(struct rxe_qp *qp, struct rxe_send_wqe *wqe)
 	 * which can lead to a deadlock. So go ahead and complete
 	 * it now.
 	 */
-	rxe_sched_task(&qp->comp.task);
+	rxe_sched_task(&qp->send_task);
 
 	return 0;
 }
@@ -732,6 +739,21 @@ int rxe_requester(struct rxe_qp *qp)
 	if (unlikely(!wqe))
 		goto exit;
 
+	/*
+	 * Don't trust user space data: a user QP's WQE comes from an mmap'd
+	 * ring, so num_sge/cur_sge are attacker-controlled. Bound num_sge like
+	 * get_srq_wqe(); bound cur_sge only when payload exists (dma.resid),
+	 * since copy_data() skips dma->sge[] on a zero-length copy (all a
+	 * max_sge == 0 QP can post).
+	 */
+	if (unlikely(wqe->dma.num_sge > qp->sq.max_sge ||
+		     (wqe->dma.resid &&
+		      wqe->dma.cur_sge >= qp->sq.max_sge))) {
+		rxe_dbg_qp(qp, "invalid num_sge/cur_sge in send wqe\n");
+		wqe->status = IB_WC_LOC_QP_OP_ERR;
+		goto err;
+	}
+
 	if (rxe_wqe_is_fenced(qp, wqe)) {
 		qp->req.wait_fence = 1;
 		goto exit;
@@ -792,7 +814,7 @@ int rxe_requester(struct rxe_qp *qp)
 						       qp->req.wqe_index);
 			wqe->state = wqe_state_done;
 			wqe->status = IB_WC_SUCCESS;
-			rxe_sched_task(&qp->comp.task);
+			rxe_sched_task(&qp->send_task);
 			goto done;
 		}
 		payload = mtu;
@@ -831,7 +853,7 @@ int rxe_requester(struct rxe_qp *qp)
 			wqe->status = IB_WC_LOC_PROT_ERR;
 		else
 			wqe->status = IB_WC_LOC_QP_OP_ERR;
-		kfree_skb(skb);
+		rxe_put_skb(skb);
 		if (ah)
 			rxe_put(ah);
 		goto err;
@@ -861,7 +883,7 @@ int rxe_requester(struct rxe_qp *qp)
 		 */
 		qp->need_req_skb = 1;
 
-		rxe_sched_task(&qp->req.task);
+		rxe_sched_task(&qp->send_task);
 		goto exit;
 	}
 
@@ -883,4 +905,21 @@ exit:
 	ret = -EAGAIN;
 out:
 	return ret;
+}
+
+int rxe_sender(struct rxe_qp *qp)
+{
+	int req_ret;
+	int comp_ret;
+
+	/* process the send queue */
+	req_ret = rxe_requester(qp);
+
+	/* process the response queue */
+	comp_ret = rxe_completer(qp);
+
+	/* exit the task loop if both requester and completer
+	 * are ready
+	 */
+	return (req_ret && comp_ret) ? -EAGAIN : 0;
 }

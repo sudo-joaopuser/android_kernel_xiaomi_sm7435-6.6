@@ -49,7 +49,7 @@ ktime_t do_timens_ktime_to_host(clockid_t clockid, ktime_t tim,
 		tim = 0;
 	} else {
 		tim = ktime_sub(tim, offset);
-		if (unlikely(tim > KTIME_MAX))
+		if (unlikely(tim < 0))
 			tim = KTIME_MAX;
 	}
 
@@ -415,6 +415,11 @@ int proc_timens_set_offset(struct file *file, struct task_struct *p,
 		if (off->val.tv_sec > KTIME_SEC_MAX ||
 		    off->val.tv_sec < -KTIME_SEC_MAX)
 			goto out;
+
+		if (off->val.tv_nsec < 0 || off->val.tv_nsec >= NSEC_PER_SEC) {
+			err = -EINVAL;
+			goto out;
+		}
 
 		tp = timespec64_add(tp, off->val);
 		/*

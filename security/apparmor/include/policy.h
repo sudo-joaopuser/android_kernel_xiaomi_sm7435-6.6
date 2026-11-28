@@ -34,6 +34,7 @@
 struct aa_ns;
 
 extern int unprivileged_userns_apparmor_policy;
+extern int aa_unprivileged_unconfined_restricted;
 
 extern const char *const aa_profile_mode_names[];
 #define APPARMOR_MODE_NAMES_MAX_INDEX 4
@@ -261,6 +262,9 @@ struct aa_profile *aa_alloc_profile(const char *name, struct aa_proxy *proxy,
 				    gfp_t gfp);
 struct aa_profile *aa_alloc_null(struct aa_profile *parent, const char *name,
 				 gfp_t gfp);
+struct aa_profile *__aa_new_learning_profile(struct aa_profile *parent,
+					     bool hat, const char *base,
+					     gfp_t gfp);
 struct aa_profile *aa_new_learning_profile(struct aa_profile *parent, bool hat,
 					   const char *base, gfp_t gfp);
 void aa_free_profile(struct aa_profile *profile);

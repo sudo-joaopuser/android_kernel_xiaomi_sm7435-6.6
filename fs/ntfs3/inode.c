@@ -126,10 +126,16 @@ next_attr:
 
 	if (le && le->vcn) {
 		/* This is non primary attribute segment. Ignore if not MFT. */
-		if (ino != MFT_REC_MFT || attr->type != ATTR_DATA)
+		if (ino != MFT_REC_MFT)
 			goto next_attr;
 
-		run = &ni->file.run;
+		if (attr->type == ATTR_DATA)
+			run = &ni->file.run;
+		else if (attr->type == ATTR_BITMAP)
+			run = &sbi->mft.bitmap.run;
+		else
+			goto next_attr;
+
 		asize = le32_to_cpu(attr->size);
 		goto attr_unpack_run;
 	}
@@ -200,6 +206,11 @@ next_attr:
 
 		names += 1;
 		fname = Add2Ptr(attr, roff);
+
+		/* Make sure the full name fits in the resident data. */
+		if (rsize < fname_full_size(fname))
+			goto out;
+
 		if (fname->type == FILE_NAME_DOS)
 			goto next_attr;
 
@@ -270,7 +281,9 @@ next_attr:
 		break;
 
 	case ATTR_ROOT:
-		if (attr->non_res)
+		if (attr->non_res ||
+		    asize < sizeof(struct INDEX_ROOT) + roff ||
+		    rsize < sizeof(struct INDEX_ROOT))
 			goto out;
 
 		root = Add2Ptr(attr, roff);
@@ -715,6 +728,14 @@ static int ntfs_read_folio(struct file *file, struct folio *folio)
 	struct address_space *mapping = page->mapping;
 	struct inode *inode = mapping->host;
 	struct ntfs_inode *ni = ntfs_i(inode);
+	loff_t vbo = folio_pos(folio);
+
+	if (ni->i_valid <= vbo) {
+		folio_zero_range(folio, 0, folio_size(folio));
+		folio_mark_uptodate(folio);
+		folio_unlock(folio);
+		return 0;
+	}
 
 	if (is_resident(ni)) {
 		ni_lock(ni);
@@ -1691,10 +1712,10 @@ struct inode *ntfs_create_inode(struct mnt_idmap *idmap, struct inode *dir,
 		goto out6;
 
 	/*
-	 * Call 'd_instantiate' after inode->i_op is set
+	 * Call 'd_instantiate_new' after inode->i_op is set
 	 * but before finish_open.
 	 */
-	d_instantiate(dentry, inode);
+	d_instantiate_new(dentry, inode);
 
 	/* Set original time. inode times (i_ctime) may be changed in ntfs_init_acl. */
 	inode->i_atime = inode->i_mtime =
@@ -1742,8 +1763,6 @@ out1:
 
 	if (err)
 		return ERR_PTR(err);
-
-	unlock_new_inode(inode);
 
 	return inode;
 }

@@ -10,6 +10,13 @@
 #include <uapi/linux/rtnetlink.h>
 
 extern int rtnetlink_send(struct sk_buff *skb, struct net *net, u32 pid, u32 group, int echo);
+
+static inline int rtnetlink_maybe_send(struct sk_buff *skb, struct net *net,
+				       u32 pid, u32 group, int echo)
+{
+	return !skb ? 0 : rtnetlink_send(skb, net, pid, group, echo);
+}
+
 extern int rtnl_unicast(struct sk_buff *skb, struct net *net, u32 pid);
 extern void rtnl_notify(struct sk_buff *skb, struct net *net, u32 pid,
 			u32 group, const struct nlmsghdr *nlh, gfp_t flags);
@@ -71,6 +78,18 @@ static inline bool lockdep_rtnl_is_held(void)
  */
 #define rtnl_dereference(p)					\
 	rcu_dereference_protected(p, lockdep_rtnl_is_held())
+
+/**
+ * rcu_replace_pointer_rtnl - replace an RCU pointer under rtnl_lock, returning
+ * its old value
+ * @rp: RCU pointer, whose value is returned
+ * @p: regular pointer
+ *
+ * Perform a replacement under rtnl_lock, where @rp is an RCU-annotated
+ * pointer. The old value of @rp is returned, and @rp is set to @p
+ */
+#define rcu_replace_pointer_rtnl(rp, p)			\
+	rcu_replace_pointer(rp, p, lockdep_rtnl_is_held())
 
 static inline struct netdev_queue *dev_ingress_queue(struct net_device *dev)
 {

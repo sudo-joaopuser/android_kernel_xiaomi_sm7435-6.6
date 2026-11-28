@@ -88,6 +88,7 @@
 #include "include/resource.h"
 
 int unprivileged_userns_apparmor_policy = 1;
+int aa_unprivileged_unconfined_restricted;
 
 const char *const aa_profile_mode_names[] = {
 	"enforce",
@@ -98,13 +99,14 @@ const char *const aa_profile_mode_names[] = {
 };
 
 
-static void aa_free_pdb(struct aa_policydb *policy)
+static void aa_free_pdb(struct aa_policydb *pdb)
 {
-	if (policy) {
-		aa_put_dfa(policy->dfa);
-		if (policy->perms)
-			kvfree(policy->perms);
-		aa_free_str_table(&policy->trans);
+	if (pdb) {
+		aa_put_dfa(pdb->dfa);
+		if (pdb->perms)
+			kvfree(pdb->perms);
+		aa_free_str_table(&pdb->trans);
+		kfree(pdb);
 	}
 }
 
@@ -664,7 +666,7 @@ struct aa_profile *aa_alloc_null(struct aa_profile *parent, const char *name,
 }
 
 /**
- * aa_new_learning_profile - create or find a null-X learning profile
+ * __aa_new_learning_profile - create or find a null-X learning profile
  * @parent: profile that caused this profile to be created (NOT NULL)
  * @hat: true if the null- learning profile is a hat
  * @base: name to base the null profile off of
@@ -681,14 +683,16 @@ struct aa_profile *aa_alloc_null(struct aa_profile *parent, const char *name,
  *
  * Returns: new refcounted profile else NULL on failure
  */
-struct aa_profile *aa_new_learning_profile(struct aa_profile *parent, bool hat,
-					   const char *base, gfp_t gfp)
+struct aa_profile *__aa_new_learning_profile(struct aa_profile *parent,
+					     bool hat, const char *base,
+					     gfp_t gfp)
 {
 	struct aa_profile *p, *profile;
 	const char *bname;
 	char *name = NULL;
 
 	AA_BUG(!parent);
+	AA_BUG(!mutex_is_locked(&parent->ns->lock));
 
 	if (base) {
 		name = kmalloc(strlen(parent->base.hname) + 8 + strlen(base),
@@ -720,7 +724,6 @@ name:
 	if (hat)
 		profile->label.flags |= FLAG_HAT;
 
-	mutex_lock_nested(&profile->ns->lock, profile->ns->level);
 	p = __find_child(&parent->base.profiles, bname);
 	if (p) {
 		aa_free_profile(profile);
@@ -728,7 +731,6 @@ name:
 	} else {
 		__add_profile(&parent->base.profiles, profile);
 	}
-	mutex_unlock(&profile->ns->lock);
 
 	/* refcount released by caller */
 out:
@@ -740,6 +742,18 @@ fail:
 	kfree(name);
 	aa_free_profile(profile);
 	return NULL;
+}
+
+struct aa_profile *aa_new_learning_profile(struct aa_profile *parent, bool hat,
+					   const char *base, gfp_t gfp)
+{
+	struct aa_profile *profile;
+
+	mutex_lock_nested(&parent->ns->lock, parent->ns->level);
+	profile = __aa_new_learning_profile(parent, hat, base, gfp);
+	mutex_unlock(&parent->ns->lock);
+
+	return profile;
 }
 
 /**
@@ -1117,6 +1131,7 @@ ssize_t aa_replace_profiles(struct aa_ns *policy_ns, struct aa_label *label,
 	struct aa_loaddata *rawdata_ent;
 	const char *op;
 	ssize_t count, error;
+	bool rawdata_created = false;
 	LIST_HEAD(lh);
 
 	op = mask & AA_MAY_REPLACE_POLICY ? OP_PROF_REPL : OP_PROF_LOAD;
@@ -1256,6 +1271,7 @@ ssize_t aa_replace_profiles(struct aa_ns *policy_ns, struct aa_label *label,
 			ent = NULL;
 			goto fail_lock;
 		}
+		rawdata_created = true;
 	}
 	list_for_each_entry(ent, &lh, list) {
 		if (!ent->old) {
@@ -1325,14 +1341,31 @@ ssize_t aa_replace_profiles(struct aa_ns *policy_ns, struct aa_label *label,
 
 out:
 	aa_put_ns(ns);
+
+	ssize_t udata_sz = udata->size;
+
 	aa_put_profile_loaddata(udata);
 	kfree(ns_name);
 
 	if (error)
 		return error;
-	return udata->size;
+	return udata_sz;
 
 fail_lock:
+	/*
+	 * Remove fs entries created by this load. Nothing else references
+	 * them yet, and leaving them behind would leak the new profiles
+	 * (their dents pin the proxy) and make the next load at the same,
+	 * unbumped ns revision fail with -EEXIST on its raw_data dir.
+	 * ensure children (which are at the end of the list are removed
+	 * before their parent
+	 */
+	list_for_each_entry_reverse(tmp, &lh, list) {
+		if (!tmp->old)
+			__aafs_profile_rmdir(tmp->new);
+	}
+	if (rawdata_created)
+		__aa_fs_remove_rawdata(udata);
 	mutex_unlock(&ns->lock);
 
 	/* audit cause of failure */

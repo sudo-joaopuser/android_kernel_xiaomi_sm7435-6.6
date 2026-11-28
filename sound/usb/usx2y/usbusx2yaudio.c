@@ -40,14 +40,27 @@ static int usx2y_urb_capt_retire(struct snd_usx2y_substream *subs)
 	for (i = 0; i < nr_of_packs(); i++) {
 		cp = (unsigned char *)urb->transfer_buffer + urb->iso_frame_desc[i].offset;
 		if (urb->iso_frame_desc[i].status) { /* active? hmm, skip this */
-			snd_printk(KERN_ERR
-				   "active frame status %i. Most probably some hardware problem.\n",
-				   urb->iso_frame_desc[i].status);
+			dev_err(&usx2y->dev->dev,
+				"%s: active frame status %i. Most probably some hardware problem.\n",
+				__func__,
+				urb->iso_frame_desc[i].status);
 			return urb->iso_frame_desc[i].status;
 		}
 		len = urb->iso_frame_desc[i].actual_length / usx2y->stride;
 		if (!len) {
-			snd_printd("0 == len ERROR!\n");
+			dev_dbg(&usx2y->dev->dev, "%s: 0 == len ERROR!\n", __func__);
+			continue;
+		}
+		/*
+		 * snd_usx2y_pcm_open() constrains the buffer to hold at least
+		 * two URBs, so this cannot happen for a device that keeps its
+		 * packets at 50 frames. Drop the packet rather than exceed the
+		 * single wrap below.
+		 */
+		if (unlikely(len > runtime->buffer_size)) {
+			dev_err_ratelimited(&usx2y->dev->dev,
+					    "%s: packet of %i frames exceeds %lu-frame buffer, dropping\n",
+					    __func__, len, runtime->buffer_size);
 			continue;
 		}
 
@@ -101,7 +114,15 @@ static int usx2y_urb_play_prepare(struct snd_usx2y_substream *subs,
 		counts = cap_urb->iso_frame_desc[pack].actual_length / usx2y->stride;
 		count += counts;
 		if (counts < 43 || counts > 50) {
-			snd_printk(KERN_ERR "should not be here with counts=%i\n", counts);
+			dev_err(&usx2y->dev->dev, "%s: should not be here with counts=%i\n",
+				__func__, counts);
+			return -EPIPE;
+		}
+		if (counts * usx2y->stride > subs->maxpacksize) {
+			dev_err_ratelimited(&usx2y->dev->dev,
+					    "%s: packet of %i bytes exceeds maxpacksize %u\n",
+					    __func__, counts * usx2y->stride,
+					    subs->maxpacksize);
 			return -EPIPE;
 		}
 		/* set up descriptor */
@@ -109,9 +130,19 @@ static int usx2y_urb_play_prepare(struct snd_usx2y_substream *subs,
 			urb->iso_frame_desc[pack - 1].offset +
 			urb->iso_frame_desc[pack - 1].length :
 			0;
-		urb->iso_frame_desc[pack].length = cap_urb->iso_frame_desc[pack].actual_length;
+		urb->iso_frame_desc[pack].length = counts * usx2y->stride;
 	}
 	if (atomic_read(&subs->state) >= STATE_PRERUNNING) {
+		/*
+		 * The copy below wraps once, which needs count <= buffer_size.
+		 * snd_usx2y_pcm_open() guarantees it; guard anyway.
+		 */
+		if (unlikely(count > runtime->buffer_size)) {
+			dev_err_ratelimited(&usx2y->dev->dev,
+					    "%s: URB of %i frames exceeds %lu-frame buffer, stopping\n",
+					    __func__, count, runtime->buffer_size);
+			return -EPIPE;
+		}
 		if (subs->hwptr + count > runtime->buffer_size) {
 			/* err, the transferred area goes over buffer boundary.
 			 * copy the data to the temp buffer.
@@ -165,11 +196,11 @@ static int usx2y_urb_submit(struct snd_usx2y_substream *subs, struct urb *urb, i
 	if (!urb)
 		return -ENODEV;
 	urb->start_frame = frame + NRURBS * nr_of_packs();  // let hcd do rollover sanity checks
-	urb->hcpriv = NULL;
 	urb->dev = subs->usx2y->dev; /* we need to set this at each time */
 	err = usb_submit_urb(urb, GFP_ATOMIC);
 	if (err < 0) {
-		snd_printk(KERN_ERR "usb_submit_urb() returned %i\n", err);
+		dev_err(&urb->dev->dev, "%s: usb_submit_urb() returned %i\n",
+			__func__, err);
 		return err;
 	}
 	return 0;
@@ -237,7 +268,8 @@ static void usx2y_clients_stop(struct usx2ydev *usx2y)
 	for (s = 0; s < 4; s++) {
 		subs = usx2y->subs[s];
 		if (subs) {
-			snd_printdd("%i %p state=%i\n", s, subs, atomic_read(&subs->state));
+			dev_dbg(&usx2y->dev->dev, "%s: %i %p state=%i\n",
+				__func__, s, subs, atomic_read(&subs->state));
 			atomic_set(&subs->state, STATE_STOPPED);
 		}
 	}
@@ -249,8 +281,9 @@ static void usx2y_clients_stop(struct usx2ydev *usx2y)
 			for (u = 0; u < NRURBS; u++) {
 				urb = subs->urb[u];
 				if (urb)
-					snd_printdd("%i status=%i start_frame=%i\n",
-						    u, urb->status, urb->start_frame);
+					dev_dbg(&usx2y->dev->dev,
+						"%s: %i status=%i start_frame=%i\n",
+						__func__, u, urb->status, urb->start_frame);
 			}
 		}
 	}
@@ -261,7 +294,8 @@ static void usx2y_clients_stop(struct usx2ydev *usx2y)
 static void usx2y_error_urb_status(struct usx2ydev *usx2y,
 				   struct snd_usx2y_substream *subs, struct urb *urb)
 {
-	snd_printk(KERN_ERR "ep=%i stalled with status=%i\n", subs->endpoint, urb->status);
+	dev_err(&usx2y->dev->dev, "%s: ep=%i stalled with status=%i\n",
+		__func__, subs->endpoint, urb->status);
 	urb->status = 0;
 	usx2y_clients_stop(usx2y);
 }
@@ -273,10 +307,12 @@ static void i_usx2y_urb_complete(struct urb *urb)
 	struct snd_usx2y_substream *capsubs, *playbacksubs;
 
 	if (unlikely(atomic_read(&subs->state) < STATE_PREPARED)) {
-		snd_printdd("hcd_frame=%i ep=%i%s status=%i start_frame=%i\n",
-			    usb_get_current_frame_number(usx2y->dev),
-			    subs->endpoint, usb_pipein(urb->pipe) ? "in" : "out",
-			    urb->status, urb->start_frame);
+		dev_dbg(&usx2y->dev->dev,
+			"%s: hcd_frame=%i ep=%i%s status=%i start_frame=%i\n",
+			__func__,
+			usb_get_current_frame_number(usx2y->dev),
+			subs->endpoint, usb_pipein(urb->pipe) ? "in" : "out",
+			urb->status, urb->start_frame);
 		return;
 	}
 	if (unlikely(urb->status)) {
@@ -296,7 +332,6 @@ static void i_usx2y_urb_complete(struct urb *urb)
 		if (!usx2y_usbframe_complete(capsubs, playbacksubs, urb->start_frame)) {
 			usx2y->wait_iso_frame += nr_of_packs();
 		} else {
-			snd_printdd("\n");
 			usx2y_clients_stop(usx2y);
 		}
 	}
@@ -346,8 +381,9 @@ static void i_usx2y_subs_startup(struct urb *urb)
 
 static void usx2y_subs_prepare(struct snd_usx2y_substream *subs)
 {
-	snd_printdd("usx2y_substream_prepare(%p) ep=%i urb0=%p urb1=%p\n",
-		    subs, subs->endpoint, subs->urb[0], subs->urb[1]);
+	dev_dbg(&subs->usx2y->dev->dev,
+		"%s(%p) ep=%i urb0=%p urb1=%p\n",
+		__func__, subs, subs->endpoint, subs->urb[0], subs->urb[1]);
 	/* reset the pointer */
 	subs->hwptr = 0;
 	subs->hwptr_done = 0;
@@ -372,7 +408,7 @@ static void usx2y_urbs_release(struct snd_usx2y_substream *subs)
 {
 	int i;
 
-	snd_printdd("%s %i\n", __func__, subs->endpoint);
+	dev_dbg(&subs->usx2y->dev->dev, "%s %i\n", __func__, subs->endpoint);
 	for (i = 0; i < NRURBS; i++)
 		usx2y_urb_release(subs->urb + i,
 				  subs != subs->usx2y->subs[SNDRV_PCM_STREAM_PLAYBACK]);
@@ -478,7 +514,8 @@ static int usx2y_urbs_start(struct snd_usx2y_substream *subs)
 			urb->transfer_buffer_length = subs->maxpacksize * nr_of_packs();
 			err = usb_submit_urb(urb, GFP_ATOMIC);
 			if (err < 0) {
-				snd_printk(KERN_ERR "cannot submit datapipe for urb %d, err = %d\n", i, err);
+				dev_err(&urb->dev->dev, "%s: cannot submit datapipe for urb %d, err = %d\n",
+					__func__, i, err);
 				err = -EPIPE;
 				goto cleanup;
 			} else {
@@ -523,17 +560,16 @@ static int snd_usx2y_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 
 	switch (cmd) {
 	case SNDRV_PCM_TRIGGER_START:
-		snd_printdd("%s(START)\n", __func__);
+		dev_dbg(&subs->usx2y->dev->dev, "%s(START)\n", __func__);
 		if (atomic_read(&subs->state) == STATE_PREPARED &&
 		    atomic_read(&subs->usx2y->subs[SNDRV_PCM_STREAM_CAPTURE]->state) >= STATE_PREPARED) {
 			atomic_set(&subs->state, STATE_PRERUNNING);
 		} else {
-			snd_printdd("\n");
 			return -EPIPE;
 		}
 		break;
 	case SNDRV_PCM_TRIGGER_STOP:
-		snd_printdd("%s(STOP)\n", __func__);
+		dev_dbg(&subs->usx2y->dev->dev, "%s(STOP)\n", __func__);
 		if (atomic_read(&subs->state) >= STATE_PRERUNNING)
 			atomic_set(&subs->state, STATE_PREPARED);
 		break;
@@ -634,7 +670,8 @@ static void i_usx2y_04int(struct urb *urb)
 	struct usx2ydev *usx2y = urb->context;
 
 	if (urb->status)
-		snd_printk(KERN_ERR "snd_usx2y_04int() urb->status=%i\n", urb->status);
+		dev_err(&urb->dev->dev, "%s() urb->status=%i\n",
+			__func__, urb->status);
 	if (!--usx2y->us04->len)
 		wake_up(&usx2y->in04_wait_queue);
 }
@@ -724,7 +761,8 @@ static int usx2y_format_set(struct usx2ydev *usx2y, snd_pcm_format_t format)
 	usb_kill_urb(usx2y->in04_urb);
 	err = usb_set_interface(usx2y->dev, 0, alternate);
 	if (err) {
-		snd_printk(KERN_ERR "usb_set_interface error\n");
+		dev_err(&usx2y->dev->dev, "%s: usb_set_interface error\n",
+			__func__);
 		return err;
 	}
 	usx2y->in04_urb->dev = usx2y->dev;
@@ -751,7 +789,7 @@ static int snd_usx2y_pcm_hw_params(struct snd_pcm_substream *substream,
 	int i;
 
 	mutex_lock(&usx2y(card)->pcm_mutex);
-	snd_printdd("snd_usx2y_hw_params(%p, %p)\n", substream, hw_params);
+	dev_dbg(&dev->dev->dev, "%s(%p, %p)\n", __func__, substream, hw_params);
 	/* all pcm substreams off one usx2y have to operate at the same
 	 * rate & format
 	 */
@@ -787,7 +825,7 @@ static int snd_usx2y_pcm_hw_free(struct snd_pcm_substream *substream)
 	struct snd_usx2y_substream *cap_subs, *playback_subs;
 
 	mutex_lock(&subs->usx2y->pcm_mutex);
-	snd_printdd("snd_usx2y_hw_free(%p)\n", substream);
+	dev_dbg(&subs->usx2y->dev->dev, "%s(%p)\n", __func__, substream);
 
 	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK) {
 		cap_subs = subs->usx2y->subs[SNDRV_PCM_STREAM_CAPTURE];
@@ -823,7 +861,7 @@ static int snd_usx2y_pcm_prepare(struct snd_pcm_substream *substream)
 	struct snd_usx2y_substream *capsubs = subs->usx2y->subs[SNDRV_PCM_STREAM_CAPTURE];
 	int err = 0;
 
-	snd_printdd("%s(%p)\n", __func__, substream);
+	dev_dbg(&usx2y->dev->dev, "%s(%p)\n", __func__, substream);
 
 	mutex_lock(&usx2y->pcm_mutex);
 	usx2y_subs_prepare(subs);
@@ -840,7 +878,8 @@ static int snd_usx2y_pcm_prepare(struct snd_pcm_substream *substream)
 			if (err < 0)
 				goto up_prepare_mutex;
 		}
-		snd_printdd("starting capture pipe for %s\n", subs == capsubs ? "self" : "playpipe");
+		dev_dbg(&usx2y->dev->dev, "%s: starting capture pipe for %s\n",
+			__func__, subs == capsubs ? "self" : "playpipe");
 		err = usx2y_urbs_start(capsubs);
 		if (err < 0)
 			goto up_prepare_mutex;
@@ -887,6 +926,18 @@ static int snd_usx2y_pcm_open(struct snd_pcm_substream *substream)
 	runtime->private_data = subs;
 	subs->pcm_substream = substream;
 	snd_pcm_hw_constraint_minmax(runtime, SNDRV_PCM_HW_PARAM_PERIOD_TIME, 1000, 200000);
+	/*
+	 * Capture wraps the ring buffer once per packet and playback once
+	 * per URB of nr_of_packs() packets of at most 50 frames (see
+	 * usx2y_urb_play_prepare()). Playback needs the buffer to hold more
+	 * than one URB and capture more than one packet; use the URB bound
+	 * for both, and two URBs rather than one, because the position only
+	 * advances when a URB is less than the whole buffer. The bound is in
+	 * frames and does not depend on the altsetting, which is selected
+	 * in prepare.
+	 */
+	snd_pcm_hw_constraint_minmax(runtime, SNDRV_PCM_HW_PARAM_BUFFER_SIZE,
+				     2 * nr_of_packs() * 50, UINT_MAX);
 	return 0;
 }
 
