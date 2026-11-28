@@ -1379,6 +1379,29 @@ static int haptics_get_closeloop_lra_period(
 		return -EINVAL;
 	}
 
+	/*
+	 * Some units come out of the bootloader with an abnormal F0 calibration,
+	 * which makes the vibration weak. When the device tree gives the valid
+	 * F0 range, fall back to the default F0 and RC clock count.
+	 */
+	if (in_boot && config->cl_t_lra_us) {
+		struct device_node *node = chip->dev->of_node;
+		u32 f0_min, f0_max, f0_default, f0_cnt;
+		u32 xbl_f0 = USEC_PER_SEC / config->cl_t_lra_us;
+
+		if (!of_property_read_u32(node, "qcom,lra-f0-min", &f0_min) &&
+		    !of_property_read_u32(node, "qcom,lra-f0-max", &f0_max) &&
+		    !of_property_read_u32(node, "qcom,lra-f0-default", &f0_default) &&
+		    !of_property_read_u32(node, "qcom,lra-f0-cal-count", &f0_cnt) &&
+		    f0_default && (xbl_f0 > f0_max || xbl_f0 < f0_min)) {
+			dev_warn(chip->dev, "Bootloader F0 %u Hz (count %#x) is out of %u-%u Hz, using %u Hz (count %#x)\n",
+				 xbl_f0, config->rc_clk_cal_count, f0_min, f0_max,
+				 f0_default, f0_cnt);
+			config->cl_t_lra_us = USEC_PER_SEC / f0_default;
+			config->rc_clk_cal_count = f0_cnt;
+		}
+	}
+
 	if ((abs(config->t_lra_us - config->cl_t_lra_us) * 100 / config->t_lra_us) >
 			CL_TLRA_ERROR_RANGE_PCT) {
 		dev_warn(chip->dev, "The calibrated period (%d us) has large variation, use open-loop LRA period (%d us) instead\n",
